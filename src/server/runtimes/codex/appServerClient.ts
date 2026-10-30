@@ -9,11 +9,11 @@ import {
   classifyServerRequest, isApprovalKind, toInternalDecision, encodeApproval, failSafeNonApproval,
 } from "./serverRequestCodec";
 import { CodexTurnItemIndex, type ObservedItem } from "./appServerItemIndex";
+import { resolveCodexBin } from "../../lib/runtimeAuth";
 
-const CODEX_BIN = process.env.CODEX_BIN ?? "codex";
 const HANDSHAKE_TIMEOUT_MS = Number(process.env.B3OS_CODEX_APPSERVER_HANDSHAKE_MS ?? 45_000);
 
-/** 승인요청(ServerRequest) — 상위가 decision 을 돌려준다. 실행 모드가 approvalPolicy never 라 실사용에서는 오지 않는다. */
+/** 승인요청(ServerRequest) — 상위가 decision 을 돌려준다. full 모드는 never, folder 모드는 on-request로 승인 요청을 받는다. */
 export interface ApprovalRequest {
   method: string; // execCommandApproval | applyPatchApproval | item/permissions/requestApproval | item/tool/requestUserInput ...
   params: Record<string, unknown>;
@@ -65,6 +65,8 @@ export interface ThreadStartOptions {
    */
   writableRoots?: string[];
   networkAccess?: boolean;
+  excludeTmpdirEnvVar?: boolean;
+  excludeSlashTmp?: boolean;
   /** resume으로 이전 대화를 이어가되 실패하면 새 thread에서 진행한다. */
   resumeThreadId?: string;
 }
@@ -79,16 +81,18 @@ export function sandboxModeToTurnPolicyType(mode: string): string {
   }
 }
 
-export type TurnSandboxPolicy = { type: string; writableRoots?: string[]; networkAccess?: boolean };
+export type TurnSandboxPolicy = { type: string; writableRoots?: string[]; networkAccess?: boolean; excludeTmpdirEnvVar?: boolean; excludeSlashTmp?: boolean };
 
 /** turn/start sandboxPolicy. 범위 칸은 workspace-write 에서만, 그리고 부른 쪽이 준 것만 싣는다(안 주면 지금과 같은 모양). */
-export function turnSandboxPolicy(opts: Pick<ThreadStartOptions, "sandbox" | "writableRoots" | "networkAccess">): TurnSandboxPolicy {
+export function turnSandboxPolicy(opts: Pick<ThreadStartOptions, "sandbox" | "writableRoots" | "networkAccess" | "excludeTmpdirEnvVar" | "excludeSlashTmp">): TurnSandboxPolicy {
   const type = sandboxModeToTurnPolicyType(opts.sandbox ?? "");
   if (opts.sandbox !== "workspace-write") return { type };
   return {
     type,
     ...(opts.writableRoots ? { writableRoots: [...opts.writableRoots] } : {}),
     ...(opts.networkAccess !== undefined ? { networkAccess: opts.networkAccess } : {}),
+    ...(opts.excludeTmpdirEnvVar !== undefined ? { excludeTmpdirEnvVar: opts.excludeTmpdirEnvVar } : {}),
+    ...(opts.excludeSlashTmp !== undefined ? { excludeSlashTmp: opts.excludeSlashTmp } : {}),
   };
 }
 
@@ -170,8 +174,15 @@ export class CodexAppServerClient {
   private lastActivityAtMs = 0;
   private turnActivityCount = 0;
   private closed = false;
+  private activityGeneration = 0;
+  private retired = false;
+  private poolActivityAtMs = Date.now();
+  get lastPoolActivityAt(): number { return this.poolActivityAtMs; }
+  notePoolActivity(): void { this.poolActivityAtMs = Date.now(); }
+  private terminationTimer?: ReturnType<typeof setTimeout>;
   /** 풀이 죽은 것을 돌려주지 않게 밖에서 상태를 볼 수 있어야 한다. */
-  get isClosed(): boolean { return this.closed; }
+  get isClosed(): boolean { return this.closed || this.retired; }
+  get isTerminated(): boolean { return !this.proc || this.proc.exitCode !== null || this.proc.signalCode !== null; }
 
   /** 팀원 CODEX_HOME을 넘기지 않으면 자식이 호스트 ~/.codex를 읽어 해당 팀원의 승인정책·권한 프로파일이 적용되지 않는다. */
   constructor(private readonly spawnOpts: { codexHome?: string; warn?: (line: string) => void } = {}) {}
@@ -186,7 +197,10 @@ export class CodexAppServerClient {
 
   /** app-server 스폰 + initialize 핸드셰이크. */
   async start(): Promise<void> {
-    const proc = spawn(CODEX_BIN, ["app-server"], {
+    if (this.retired) throw new Error("client retired");
+    const bin = resolveCodexBin();
+    if (!bin) throw new Error("codex CLI executable not found");
+    const proc = spawn(bin, ["app-server"], {
       stdio: ["pipe", "pipe", "pipe"],
       env: appServerSpawnEnv(this.spawnOpts.codexHome),
     });
@@ -205,7 +219,10 @@ export class CodexAppServerClient {
 
   private withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-      const t = setTimeout(() => { this.close(); reject(new Error(`${what}_timeout after ${ms}ms`)); }, ms);
+      const t = setTimeout(() => {
+        try { this.close(); } catch { /* close logs the failed termination; preserve the timeout result. */ }
+        reject(new Error(`${what}_timeout after ${ms}ms`));
+      }, ms);
       p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
     });
   }
@@ -335,15 +352,80 @@ export class CodexAppServerClient {
     return this.threadId;
   }
 
+  /** 전체 loaded thread를 확인해야 진행 중인 하위 작업을 끊지 않고 MCP 프로세스를 정리할 수 있다.
+   * 알 수 없는 상태·조회 실패·조회 중 새 thread 생성은 유휴로 판단하지 않는다. */
+  async isIdle(): Promise<boolean> {
+    if (this.closed || this.retired || this.turnResolve) return false;
+    const generation = this.activityGeneration;
+    const deadline = Date.now() + 2000;
+    try {
+      const loaded = async (): Promise<string[] | null> => {
+        const ids: string[] = [];
+        let cursor: string | undefined;
+        for (let page = 0; page < 20; page++) {
+          if (Date.now() >= deadline) return null;
+          const r = await this.request("thread/loaded/list", { limit: 100, ...(cursor ? { cursor } : {}) }, deadline - Date.now());
+          if (!Array.isArray(r?.data) || r.data.some((id: unknown) => typeof id !== "string")) return null;
+          ids.push(...r.data);
+          if (r.nextCursor == null) return [...new Set(ids)].sort();
+          if (typeof r.nextCursor !== "string" || r.nextCursor === cursor) return null;
+          cursor = r.nextCursor;
+        }
+        return null;
+      };
+      const ids = await loaded();
+      if (!ids) return false;
+      if (Date.now() >= deadline) return false;
+      const states = await Promise.all(ids.map((threadId) =>
+        this.request("thread/read", { threadId, includeTurns: false }, Math.max(1, deadline - Date.now()))));
+      if (states.some((r) => r?.thread?.status?.type !== "idle")) { this.notePoolActivity(); return false; }
+      const after = await loaded();
+      return generation === this.activityGeneration && !this.closed && !this.turnResolve && after !== null && JSON.stringify(ids) === JSON.stringify(after);
+    } catch { return false; }
+  }
+
+  /** The final status check is followed by synchronous pool retirement, never by
+   * a reusable process in a half-closed state. Signals belong to retirement cleanup. */
+  async retireIfIdle(commit: () => boolean): Promise<boolean> {
+    const generation = this.activityGeneration;
+    if (this.retired || !await this.isIdle() || generation !== this.activityGeneration || !commit()) return false;
+    this.retired = true;
+    return true;
+  }
+
   close(): void {
+    const proc = this.proc;
+    if (!proc || proc.exitCode !== null || proc.signalCode !== null) {
+      this.closed = true;
+      return;
+    }
+    // A failed signal must remain retryable and visible to the pool.
+    try {
+      if (!proc.kill("SIGTERM")) throw new Error("SIGTERM returned false");
+    } catch (error) {
+      this.warn("[codex] app-server termination failed; retained for retry");
+      throw error;
+    }
     this.closed = true;
-    try { this.proc?.kill("SIGTERM"); } catch { /* noop */ }
-    this.proc = null;
+    if (this.terminationTimer) clearTimeout(this.terminationTimer);
+    const force = () => {
+      if (proc.exitCode !== null || proc.signalCode !== null) return;
+      try {
+        if (!proc.kill("SIGKILL")) throw new Error("SIGKILL returned false");
+      } catch {
+        this.warn("[codex] app-server force termination failed; retrying");
+      }
+      this.terminationTimer = setTimeout(force, 1000);
+      this.terminationTimer.unref?.();
+    };
+    this.terminationTimer = setTimeout(force, 1000);
+    this.terminationTimer.unref?.();
+    proc.once("close", () => { clearTimeout(this.terminationTimer); if (this.proc === proc) this.proc = null; });
   }
 
   //  내부
   private send(obj: Record<string, unknown>): void {
-    if (this.closed || !this.proc) throw new Error("client closed");
+    if (this.closed || this.retired || !this.proc) throw new Error("client closed");
     this.proc.stdin.write(JSON.stringify(obj) + "\n");
   }
   /** 요청(응답 기대). */
@@ -443,6 +525,7 @@ export class CodexAppServerClient {
   private async handleServerRequest(id: number | string, method: string, params: Record<string, unknown>): Promise<void> {
     // Phase1 ②: 모든 요청에 {decision} 반환하던 것을 method별 분기로 교체(11종 중 승인 4종만 decision류).
     // 근거=serverRequestCodec(Ames 0.144.6 schema 검증). 잘못된 result는 Codex pending을 오류/폴백에 의존시키거나 hang.
+    this.notePoolActivity();
     const kind = classifyServerRequest(method);
     if (kind === "unknown") { this.respondError(id, -32601, `unknown server request: ${method}`); return; }
 
@@ -452,11 +535,11 @@ export class CodexAppServerClient {
       let decision: ReturnType<typeof toInternalDecision> = "decline"; // fail-closed 기본
       // S2: 이 승인이 가리키는 항목을 먼저 온 알림 에서 찾아 실어 준다(조회 요청이 없으므로 '기억' 으로).
       //   같은 turn·같은 itemId 일 때만 붙는다 — 어긋나면 undefined 라 상위가 매번 묻는 경로로 간다.
-      const observedItem = this.itemIndex.lookup(params?.itemId, params?.turnId) ?? undefined;
+      const itemLookup = () => this.itemIndex.lookup(params?.itemId, params?.turnId) ?? undefined;
       // M5.3: 승인 대기(팝업) 동안 턴 타이머 정지 → 사람이 폰으로 승인하는 시간이 turn timeout에 안 잡힘.
       this.pauseTurnTimer();
       try {
-        if (handler) decision = toInternalDecision(await handler({ method, params, serverRequestId: String(id), observedItem }));
+        if (handler) decision = toInternalDecision(await handler({ method, params, serverRequestId: String(id), get observedItem() { return itemLookup(); } }));
       } catch { decision = "decline"; }
       finally { this.resumeTurnTimer(); } // 결정 받으면 즉시 재개(예외에도 보장)
       const out = encodeApproval(kind, decision, params);
@@ -473,6 +556,8 @@ export class CodexAppServerClient {
   }
 
   private handleNotification(method: string, params: any): void {
+    // Child followups can start without acquiring this pool entry again.
+    if (method.startsWith("thread/") || isTurnProgress(method)) { this.activityGeneration++; this.notePoolActivity(); }
     // 진행 신호마다 무응답 시계를 되돌려 일하는 턴을 자르지 않고 조용히 멈춘 턴만 종료한다.
     if (isTurnProgress(method)) this.noteTurnAlive();
     this.activeHandlers?.onNotify?.(method, params);
