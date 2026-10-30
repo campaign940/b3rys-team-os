@@ -2,8 +2,8 @@ import { expect,test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { cogsActivityLine } from "../codex/cogsActivity";
-import { claudeCogsArguments, runClaudeCogsTurn } from "./cogsRunner";
+import { cogsActivityArgs, cogsActivityCode, cogsActivityLine } from "../codex/cogsActivity";
+import { claudeCogsArguments, claudeToolItem, runClaudeCogsTurn } from "./cogsRunner";
 import { claudeCogsPaths,renderClaudeCogsWrapper,writeClaudeCogsFilesAt } from "./cogsLauncher";
 
 test("app Claude launch strips Telegram credentials and ignores workspace plugin configuration",async()=>{
@@ -122,4 +122,106 @@ open(${JSON.stringify(sentinel)},"w").write("executed")
   if(priorRegistry===undefined)delete process.env.TEAM_AGENT_REGISTRY;else process.env.TEAM_AGENT_REGISTRY=priorRegistry;
   rmSync(root,{recursive:true,force:true});
  }
+});
+
+test("Claude tools map to the same activity codes as codex, without raw inputs",()=>{
+ const cases:[string,unknown,string|undefined,ReturnType<typeof cogsActivityArgs>][]=[
+  ["Read",{file_path:"/Users/x/secret-project/notes.md"},"read_files",{target:"notes.md"}],
+  ["Glob",{pattern:"**/*password*"},"read_files",{}],
+  ["Grep",{pattern:"api_key=sk-live",path:"/tmp"},"read_files",{}],
+  ["Edit",{file_path:"/w/app/main.swift",old_string:"a",new_string:"b"},"code_edit",{target:"main.swift"}],
+  ["Write",{file_path:"/w/README.md",content:"x"},"writing",{target:"README.md"}],
+  ["MultiEdit",{file_path:"/w/config.json",edits:[]},"edit_files",{target:"config.json"}],
+  ["WebFetch",{url:"https://example.com/a?token=abc",prompt:"p"},"fetch_web",{target:"example.com"}],
+  ["WebSearch",{query:"오늘 날씨"},"search",{target:"오늘 날씨"}],
+  ["Bash",{command:"bun test src"},"run_tests",{target:"bun test"}],
+  ["TodoWrite",{todos:[]},"plan",{}],
+ ];
+ for(const [name,input,code,args] of cases){
+  const item=claudeToolItem(name,input);
+  expect(cogsActivityCode(item),name).toBe(code);expect(cogsActivityArgs(item),name).toEqual(args);
+ }
+ for(const [name,input] of [["Read",{}],["Edit",{file_path:""}],["Task",{prompt:"x"}],["WebSearch",{query:5}]] as const) expect(claudeToolItem(name,input),name).toBeUndefined();
+});
+
+test("each Claude tool call is announced once across partial JSON, block stop and the assistant message",async()=>{
+ const root=mkdtempSync(join(tmpdir(),"cogs-claude-activity-"));
+ const workspace=join(root,"member"),home=join(root,"state"),binary=join(root,"fake-claude");
+ mkdirSync(workspace);mkdirSync(home);
+ writeFileSync(binary,`#!/usr/bin/env python3
+import json,sys
+if "--version" in sys.argv: print("2.1.296 (Claude Code)"); sys.exit(0)
+def out(o): print(json.dumps(o),flush=True)
+def block(i,bid,name,inp):
+  out({'type':'stream_event','event':{'type':'content_block_start','index':i,'content_block':{'type':'tool_use','id':bid,'name':name,'input':{}}}})
+  s=json.dumps(inp); h=len(s)//2
+  out({'type':'stream_event','event':{'type':'content_block_delta','index':i,'delta':{'type':'input_json_delta','partial_json':s[:h]}}})
+  out({'type':'stream_event','event':{'type':'content_block_delta','index':i,'delta':{'type':'input_json_delta','partial_json':s[h:]}}})
+  out({'type':'stream_event','event':{'type':'content_block_stop','index':i}})
+block(0,'t1','Read',{'file_path':'/w/README.md'})
+block(1,'t2','Grep',{'pattern':'TODO'})
+out({'type':'assistant','message':{'content':[{'type':'tool_use','id':'t1','name':'Read','input':{'file_path':'/w/README.md'}},{'type':'tool_use','id':'t2','name':'Grep','input':{'pattern':'TODO'}}]}})
+out({'type':'stream_event','event':{'type':'content_block_start','index':0,'content_block':{'type':'tool_use','id':'t3','name':'WebFetch','input':{}}}})
+out({'type':'stream_event','event':{'type':'content_block_stop','index':0}})
+out({'type':'assistant','message':{'content':[{'type':'tool_use','id':'t3','name':'WebFetch','input':{'url':'https://example.com/x','prompt':'p'}}]}})
+block(1,'t4','Edit',{'file_path':'/w/a.ts','old_string':'1','new_string':'2'})
+out({'type':'stream_event','event':{'type':'content_block_delta','delta':{'type':'text_delta','text':'답'}}})
+out({'type':'result','result':'답','is_error':False,'session_id':'s'})
+`);chmodSync(binary,0o700);
+ const prior=process.env.CLAUDE_BIN;process.env.CLAUDE_BIN=binary;
+ try {
+  const items:unknown[]=[];
+  const result=await runClaudeCogsTurn({agentId:"testmate",cwd:workspace,codexHome:home,prompt:"q",model:"sonnet",onActivity:(_l,_i,item)=>items.push(item)});
+  expect(result.ok).toBe(true);
+  expect(items.map(cogsActivityCode)).toEqual(["read_files","read_files","fetch_web","code_edit"]);
+  expect(items.map(cogsActivityArgs)).toEqual([{target:"README.md"},{},{target:"example.com"},{target:"a.ts"}]);
+ } finally {if(prior===undefined)delete process.env.CLAUDE_BIN;else process.env.CLAUDE_BIN=prior;rmSync(root,{recursive:true,force:true});}
+});
+
+test("card mode enables only explicit MCP configuration and disables inherited hooks/plugins/commands",()=>{
+ const root=mkdtempSync(join(tmpdir(),"cogs-card-args-"));
+ try {
+  const args=claudeCogsArguments({agentId:"fixture",cwd:root,prompt:""},"",root,"folder","/fixture/gate.sock");
+  expect(args).not.toContain("--safe-mode");expect(args).not.toContain("--restricted");
+  expect(args).toContain("--disable-slash-commands");expect(args).toContain("--strict-mcp-config");
+  expect(args[args.indexOf("--setting-sources")+1]).toBe("");
+  expect(args[args.indexOf("--permission-mode")+1]).toBe("default");
+  expect(args[args.indexOf("--permission-prompt-tool")+1]).toBe("mcp__cogs_permission__ask");
+  const settings=JSON.parse(args[args.indexOf("--settings")+1]!);
+  expect(settings.disableAllHooks).toBe(true);expect(settings.enabledPlugins).toEqual({});expect(settings.autoMemoryEnabled).toBe(false);
+ } finally {rmSync(root,{recursive:true,force:true});}
+});
+
+test("card runner protects runtime homes and standalone claude.json before checker or card", async () => {
+ const root=mkdtempSync(join(tmpdir(),"cogs-protected-homes-"));
+ const binary=join(root,"fake-cli"),capture=join(root,"replies.json"),checker=join(root,"checker-called");
+ // Only submit path names to the gate; never read or write their contents.
+ const targets=[".claude.json", ".claude/settings.json", ".codex/config.toml", ".openclaw/openclaw.json"].map(p=>join(process.env.HOME ?? "/nonexistent",p));
+ writeFileSync(binary,`#!/usr/bin/env python3
+import json,socket,sys
+if "--version" in sys.argv: print("2.1.310 (Claude Code)"); sys.exit(0)
+args=sys.argv[1:]
+config=json.loads(args[args.index("--mcp-config")+1])
+if not config["mcpServers"]:
+ open(${JSON.stringify(checker)},"w").write("called")
+ print('{"verdict":"deny","reason":"fixture_checker"}')
+ sys.exit(0)
+path=config["mcpServers"]["cogs_permission"]["args"][-1]
+replies=[]
+for target in ${JSON.stringify(targets)}:
+ with socket.socket(socket.AF_UNIX) as client:
+  client.connect(path)
+  client.sendall((json.dumps({"tool_name":"Write","input":{"file_path":target,"content":"synthetic"}})+"\\n").encode())
+  replies.append(json.loads(client.makefile().readline()))
+json.dump(replies,open(${JSON.stringify(capture)},"w"))
+print(json.dumps({"type":"result","result":"complete","is_error":False}))
+`);chmodSync(binary,0o700);
+ const prior=process.env.CLAUDE_BIN;process.env.CLAUDE_BIN=binary;
+ let cards=0;
+ try {
+  const result=await runClaudeCogsTurn({agentId:"fixture",cwd:root,prompt:"fixture",onCogsApproval:async()=>{cards++;return "approved";}});
+  expect(result.ok).toBe(true);
+  expect(JSON.parse(readFileSync(capture,"utf-8"))).toEqual(targets.map(()=>({behavior:"deny",message:"protected_path: 보호된 경로에는 쓸 수 없어요"})));
+  expect(cards).toBe(0);expect(existsSync(checker)).toBe(false);
+ } finally {if(prior===undefined)delete process.env.CLAUDE_BIN;else process.env.CLAUDE_BIN=prior;rmSync(root,{recursive:true,force:true});}
 });

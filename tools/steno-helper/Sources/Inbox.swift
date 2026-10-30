@@ -102,16 +102,22 @@ func runInbox(sourcePath: String, destinationPath: String) -> Int32 {
     guard destinationDir >= 0 else { fail("받은 파일 폴더 열기 실패"); return 1 }
     defer { close(destinationDir) }
     guard cleanupStenoParts(destinationDir) else { return 1 }
-    guard let directory = fdopendir(dup(sourceDir)) else { fail("outbox 읽기 실패"); return 1 }
-    defer { closedir(directory) }
-    var rejected = false
-    while let entry = readdir(directory) {
-        let name = withUnsafePointer(to: &entry.pointee.d_name) {
-            $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXNAMLEN) + 1) { String(cString: $0) }
+    guard let names = uploadListNames(sourceDir) else { fail("outbox 읽기 실패"); return 1 }
+    // outbox 의 하위 폴더(steno-send.sh --folder)는 받은 파일 아래 같은 이름 폴더로 넣는다. 없으면 만든다.
+    let backupPath = (sourcePath as NSString).deletingLastPathComponent + "/steno-shared"
+    let ok = walkOutbox(sourceDir, [], names, handle: { dir, name, folders in
+        if isStenoPart(name) { return true }
+        // 받은 파일의 같은 자리 바꾸기·치우기(steno-send.sh --to-received --replace/--remove). 규칙은 팀 공유와 같다(ShareReplace.swift).
+        if folders.isEmpty && name.hasPrefix(".replace-") && name.hasSuffix(".json") {
+            return consumeReplace(source: dir, requestName: name, destination: destinationDir, backupPath: backupPath)
         }
-        if isStenoPart(name) || name == "." || name == ".." { continue }
-        guard validName(name) else { fail("파일 이름/확장자 거절: \(name)"); rejected = true; continue }
-        if !copyFile(sourceDir: sourceDir, destinationDir: destinationDir, name: name) { rejected = true }
-    }
+        if name.hasPrefix(".replace-") && (name.hasSuffix(".data") || name.hasSuffix(".tmp")) { return true }
+        guard validName(name) else { fail("파일 이름/확장자 거절: \((folders + [name]).joined(separator: "/"))"); return false }
+        let target = openSubdirectory(destinationDir, folders, create: true)
+        guard target >= 0 else { fail("받은 파일 하위 폴더 열기 실패: \(folders.joined(separator: "/"))"); return false }
+        defer { close(target) }
+        return copyFile(sourceDir: dir, destinationDir: target, name: name)
+    }, list: uploadListNames)
+    let rejected = !ok
     return rejected ? 1 : 0
 }

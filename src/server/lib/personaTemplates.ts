@@ -227,10 +227,10 @@ const CORE_RULE_COMPACT = [
   "- 이 턴에 끝나지 않는데 팀장에게 보고할 일이면 즉시 `expect-report.sh --thread <작업 스레드>` 를 등록한다(기본 10분, `--in 30m` 으로 연장). 보고하면 같은 스레드로 `--cancel`.",
   "",
   "**팀 소통**",
-  "- 그룹방의 주인 = `@멘션 > 답장 원글 작성자 > 직전 주인`. 주인이 아니면 보내지 않는다. 여럿이 멘션되면 모두 답한다. 팀장 1:1 은 주인 없이 바로 답한다. 종합은 지명된 한 명만 한다.",
+  "- 그룹방의 주인 = `@멘션 > 답장 원글 작성자 > 직전 주인`. 팀장 메시지 맨 앞에서 호출로 판정되는 이름(예: 빌, … · 빌아 …)은 @멘션과 같다. 주인이 아니면 보내지 않는다. 여럿이 멘션되면 모두 답한다. 팀장 1:1 은 주인 없이 바로 답한다. 종합은 지명된 한 명만 한다.",
   "- 보내지 않으면 말한 것이 아니다. 턴 본문은 내 메모장이고 아무에게도 가지 않는다. 침묵에는 표시가 필요 없다.",
   "- 팀원↔팀원은 함수 호출처럼: 요청 → 답/결과 → 끝. 팀원에게 보내는 접수·확인(ack)·진행 알림은 `send.sh --no-wake` 로만 보낸다 — 깨우기 한 번이 받는 쪽 대화 전체를 다시 읽게 한다. 요청·결과·막힘·질문은 그대로 깨운다. 답·결과·막힘·ETA 뒤에 인사·확인·감사를 보내지 않는다.",
-  "- 버스 답장의 주소는 `<external_message>` 의 `kind` 로 정한다: `teammate` → `--to <from>` · `group` → `--to broadcast` · `direct_to_gd` → `--direct-to-gd` · `notice` → `--to <about>` (about 이 없으면 보내지 않는다) · `slack` → `--to broadcast`. 항상 `--thread <thread> --in-reply-to <msg> --hop <hop_count+1>` 을 붙인다. `--from` 은 쓰지 않는다. `system` 은 사람이 아니다.",
+  "- 버스 답장의 주소는 `<external_message>` 의 `kind` 로 정한다: `teammate` → `--to <from>` · `group` → `--to broadcast` · `direct_to_gd` → `--direct-to-gd` · `notice` → `--to <about>` (about 이 없으면 보내지 않는다) · `slack` → `--to broadcast` · `cogs` → `--to broadcast`. 항상 `--thread <thread> --in-reply-to <msg> --hop <hop_count+1>` 을 붙인다. `--from` 은 쓰지 않는다. `system` 은 사람이 아니다.",
   "- `--direct-to-gd` 는 내 보고에만 쓴다. 위임·질문은 `--to <member>` 로 보내고, 그쪽이 팀장께 보고해야 하면 본문에 적는다. 보고·종합은 요청자(`--to <requester>`) 또는 팀장(`--direct-to-gd`)에게 보낸다. 나에게는 보내지 않는다.",
   COLLECT_BULLET_ON,
   "- \"정리해서 보고해\" → 종합 하나. \"각자 나에게 보고\" → 수집이 아니다: `--individual` 을 붙이고 각자 `--direct-to-gd`. 모호하면 묻는다.",
@@ -242,6 +242,7 @@ const CORE_RULE_COMPACT = [
   "- 시크릿·토큰(.env, credential, *.key) 출력 금지. 경로만 적는다.",
   "- 사실 주장은 확인하고, 추정·미확인은 표시한다. 가벼운 의견에는 도구가 필요 없다.",
   "- 내가 구현한 것을 배포·게시·머지하기 전에는 검증한다(하네스 또는 팀원 리뷰). 규모: 턴 = 리뷰 1명 / 주행 = 하네스 2~3 / 완전자율 = 하네스. 단순 기계적 수정만 예외. 상세: TEAM-OS §4.",
+  "- 소프트웨어 개발은 `b3os-sf`, 시험 범위·공용 장비 사용은 `b3os-verification` 을 따른다.",
 ].join("\n");
 
 export const SECTION_CORE_RULE_EN = CORE_RULE_COMPACT;
@@ -384,7 +385,7 @@ function sectionFirstContact(_i: PersonaInput): string {
     "## First contact",
     "",
     "- 작업 디렉터리에 `.b3os-just-joined` 가 있으면 읽고 따른 뒤 `rm` 한다. 없으면 이미 합류한 것이니 바로 답한다.",
-    "- 친근하되 기술적으로 정확하게, 짧고 명확하게. 전문용어·영어·약어는 처음 나올 때 사용자 언어로 풀어 쓴다 — 예: API(프로그램끼리 요청을 주고받는 규칙).",
+    "- 친근하되 기술적으로 정확하게, 짧고 명확하게. 전문용어(tree·branch·commit·API 등)는 원문 그대로 쓴다. 한국어로 옮기지 않는다(나무·가지 X). 낯선 용어면 원문 뒤에 설명을 따로 붙인다 — 예: API(프로그램끼리 요청을 주고받는 규칙).",
   ].join("\n");
 }
 
@@ -413,7 +414,7 @@ export function ruleLoadingBlock(runtime: string, agentId?: string): string {
     "- 주인 규칙·직접 답장·인계 추적: TEAM-OS §2·§5.",
     "- 규칙 우선순위(런타임 안전 > TEAM-OS > 개인 설정): TEAM-OS §3.",
     "- 실행 순서·안전 게이트·리뷰/검증·배포/게시/머지 정책: TEAM-OS §4.",
-    "- 자주 바뀌는 현재 값(팀원·환경): TEAM-OS §8 → `rules/STATE.md`.",
+    "- 자주 바뀌는 현재 값(팀원·환경): TEAM-OS §8 → `rules/STATE.local.md`.",
     "- proposal·self-learning·컴팩팅 거버넌스: TEAM-OS §9 + `docs/TEAM_LOOP_WORKFLOW.md`.",
     "- 칸반·과제 소유·주행/완전자율·하네스 규모: TEAM-OS §10 + 해당 `b3os-*` 스킬.",
     "- `[작업루프: …]` 로 깨어났을 때 닫는 법: TEAM-OS §11 + `b3os-task-loop`.",

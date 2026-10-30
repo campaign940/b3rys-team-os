@@ -145,6 +145,42 @@ export function detectExplicitTargets(text: string, agents: AgentRecord[]): stri
 // 과거/상태/산출물 참조("코덱스가 전에 말한", "데미스가 만든", "Demis 가 일어났네") 는 호출이 아니므로 제외.
 const NAME_REFERENCE_TAIL = /^(이|가|은|는|의)?\s{0,4}(전에|이전에|아까|말한|얘기한|설정한|답변한|보낸|만든|작성한|일어났|깨어났|응답한)/;
 
+// 평문 호출은 발신자가 확인된 사람 메시지의 선두에서만 해석한다.
+export function hasLeadingAllAddress(text: string): boolean {
+  return /^(모두|다들|전체|얘들아|all|올|여러분)(?=[,.\s]|$)/i.test(text.trimStart());
+}
+
+export function detectLeadingNameTargets(text: string, agents: AgentRecord[]): string[] {
+  const aliases = agents.flatMap((agent) =>
+    [...new Set([...(agent.nicknames ?? []), agent.id, agent.display_name])]
+      .filter((alias) => alias && !alias.startsWith("@"))
+      .map((alias) => ({ alias, id: agent.id })),
+  ).sort((a, b) => b.alias.length - a.alias.length);
+  // off는 기존 main의 조사·과거 참조 판정을 보존한다. 미설정은 새 조사 규칙을 사용한다.
+  const particlesEnabled = process.env.ROUTER_LEADING_NAME_PARTICLES !== "off";
+  const ending = particlesEnabled
+    ? /^(?:(?:님|씨)(?:도|는|은|가|이)?|아|야|도|는|은|가|이)?(?=[,.~!?…\s]|$)/
+    : /^(?:아|야|님)?(?=[,.~!?…\s]|$)/;
+  const targets = new Set<string>();
+  let rest = text.trimStart();
+  while (rest) {
+    const matches = aliases.filter(({ alias }) => {
+      if (!rest.toLowerCase().startsWith(alias.toLowerCase())) return false;
+      const tail = rest.slice(alias.length);
+      if (!particlesEnabled && NAME_REFERENCE_TAIL.test(tail)) return false;
+      // 연결·대상 조사는 허용 목록에 없으므로 해당 이름을 추가하기 전에 중단한다.
+      return ending.test(tail);
+    });
+    const first = matches[0];
+    if (!first) break;
+    const length = first.alias.length;
+    for (const match of matches.filter((m) => m.alias.length === length)) targets.add(match.id);
+    rest = rest.slice(length).replace(ending, "");
+    rest = rest.replace(/^[,.~!?…\s]+/, "");
+  }
+  return [...targets];
+}
+
 // 평문 이름은 단순 언급일 수 있어 HYBRID 호출은 @가 붙은 별칭만 인정한다.
 export function detectAddressedNamesLoose(text: string, agents: AgentRecord[]): string[] {
   const targets: string[] = [];
