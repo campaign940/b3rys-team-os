@@ -3,6 +3,7 @@
 //     - url_verification: returns the challenge token
 //     - event_callback (app_mention): converts to envelope + inserts via inbox
 //   POST /api/slack/post — admin helper to post a message to Slack as a given agent
+//   GET  /api/slack/read — read-only helper: recent messages or a thread from an allowlisted channel
 import { bodyWithSlackFiles, receivedSlackMessage, type SlackFile } from "../lib/slackFiles";
 import { Hono } from "hono";
 import type { Database } from "bun:sqlite";
@@ -19,6 +20,7 @@ import {
   allMentionedUsers,
 } from "../lib/slack";
 import { injectOrPark, type ParkDeps } from "../lib/injectParked";
+import { readSlackChannel } from "../lib/slackRead";
 import { getLocale } from "../lib/captureConfig";
 import { runOpenclawSlackTurn } from "../lib/openclawBridge";
 import { runHermesTeamTurn } from "../lib/hermesBridge";
@@ -121,6 +123,31 @@ export function createSlackRoutes(deps: SlackRouteDeps): Hono {
     }
     appendAudit(deps.db, agent_id, "slack_post_sent", null, { channel, thread_ts, ts: result.ts });
     return c.json({ ok: true, ts: result.ts });
+  });
+
+  // Read-only helper: recent channel messages or one thread, read with the given agent's own bot token.
+  // query: agent_id, channel?, thread_ts?, limit?, since? — channel must be in setting slack_read_channels.
+  r.get("/slack/read", async (c) => {
+    const agentId = c.req.query("agent_id") ?? "";
+    if (!agentId) return c.json({ ok: false, error: "agent_id_required" }, 400);
+    const limitParam = c.req.query("limit");
+    const result = await readSlackChannel({
+      db: deps.db,
+      agents: deps.agents(),
+      agentId,
+      creds: loadAgentCreds(agentId),
+      channel: c.req.query("channel"),
+      threadTs: c.req.query("thread_ts"),
+      since: c.req.query("since"),
+      limit: limitParam ? Number(limitParam) : undefined,
+    });
+    const body = result.body as { channel?: string; count?: number; error?: string };
+    appendAudit(deps.db, agentId, result.status === 200 ? "slack_read" : "slack_read_failed", null, {
+      channel: body.channel ?? c.req.query("channel") ?? null,
+      thread_ts: c.req.query("thread_ts") ?? null,
+      ...(result.status === 200 ? { count: body.count } : { error: body.error }),
+    });
+    return c.json(result.body, result.status);
   });
 
   return r;

@@ -1,8 +1,8 @@
 ---
 name: b3os-team-inbox
-description: 팀 message bus 로 inbox 조회, 메시지 전송, 읽음 표시, 팀장 보고, 그룹방 발신, 수집 위임 종합을 하는 도구. 팀원에게 메시지를 보내거나 답할 때, Slack·Telegram 에서 온 thread 에 응답할 때, 슬랙에 글을 올리거나 슬랙에서 팀원을 부를 때(slack-post.sh) 쓴다.
-trigger: message a teammate
-entry: scripts/send.sh · inbox.sh
+description: 팀 message bus 로 inbox 조회, 메시지 전송, 읽음 표시, 팀장 보고, 그룹방 발신, 수집 위임 종합을 하는 도구. 팀원에게 메시지를 보내거나 답할 때, Slack·Telegram 에서 온 thread 에 응답할 때, 슬랙에 글을 올리거나 슬랙에서 팀원을 부를 때(slack-post.sh), "슬랙 확인해줘"처럼 슬랙 채널 내용을 읽어 요약할 때(slack-read.sh, 읽기 전용) 쓴다.
+trigger: message a teammate · read slack channel
+entry: scripts/send.sh · inbox.sh · slack-read.sh
 ---
 
 # b3os-team-inbox
@@ -19,6 +19,7 @@ entry: scripts/send.sh · inbox.sh
 - 팀장께 최종 보고 → 아래 `--direct-to-gd`
 - 그룹방에 말하기 → 아래 `--to broadcast`
 - 슬랙 게시·호출 → `references/slack.md`
+- 슬랙 읽기("슬랙 확인해줘") → `slack-read.sh` · `references/slack.md` "슬랙 읽기"
 - cogs 리액션(`react.sh`) · 팀버스 맥락 조회(`bus-recall.sh`) · Steno 파일 보내기(`steno-send.sh`) · 응답가드(`expect-report.sh`) → `references/tools.md`
 
 옵션 값은 `--thread <값>` 처럼 공백으로 쓴다. `--thread=<값>` 은 `unknown arg` 로 실패한다. 신원은 워크스페이스에서 자동 판정되고 `--from` 은 막혀 있다.
