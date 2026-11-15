@@ -322,7 +322,7 @@ export function findRouteByTgMessageId(
 ): { reason: string; targets: string[] } | null {
   const rows = db
     .prepare(
-      `SELECT meta_json FROM message WHERE from_agent_id = 'user' AND meta_json LIKE ? ORDER BY created_at DESC LIMIT 5`,
+      `SELECT meta_json FROM message WHERE from_agent_id = 'user' AND meta_json LIKE ? AND created_at >= datetime('now', '-10 minutes') ORDER BY created_at DESC LIMIT 5`,
     )
     .all(`%"message_id":"${tgMessageId}"%`) as Array<{ meta_json: string | null }>;
   for (const r of rows) {
